@@ -11,8 +11,25 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
-
 def find_multiple(n: int, k: int) -> int:
+    """
+    Finds the smallest multiple of k that is  >= to n.
+
+    Args:
+        n (int): The number to find the multiple for.
+        k (int): The number to find the multiple of.
+
+    Returns:
+        int: The smallest multiple of k that is greater than or equal to n.
+    
+    Examples:
+        >>> find_multiple(5, 3)
+        6
+        >>> find_multiple(6, 3)
+        6
+        >>> find_multiple(7, 3)
+        9
+    """
     if n % k == 0:
         return n
     return n + k - (n % k)
@@ -20,23 +37,50 @@ def find_multiple(n: int, k: int) -> int:
 @dataclass
 class ModelArgs:
     block_size: int = 2048
+    # Maximum number of tokens in a sequence
+
     vocab_size: int = 32000
+    # Number of tokens in the model vocabulary
+
     n_layer: int = 32
+    # Number of layers
+
     n_head: int = 32
+    # Number of attention heads
+
     dim: int = 4096
+    # Size of each token embedding
+
     intermediate_size: int = None
+    # Size of the intermediate layer in the feedforward block
+    # If not specified, defaults to:
+    # int(2*4*dim/3) rounded to the nearest multiple of 256
+    
     n_local_heads: int = -1
+    # Number of KV heads. If not specified, defaults to n_head,
+    # which implements standard self-attention. If specified,
+    # implements GQA if `n_local_heads` is > 1, else implements MQA.
+
     head_dim: int = 64
+    # Size of each head
+
     rope_base: float = 10000
     norm_eps: float = 1e-5
 
     def __post_init__(self):
+        # If n_local_heads is not specified, set number of KV heads to number of Q heads.
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
+        
+        # If intermediate_size is not specified, set it to 2/3 of 4*dim, rounded to the nearest multiple of 256.
+        # e.g., for llama-2-7b, intermediate_size = find_multiple(2/3 * 4 * 4096) = 11008
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
+        
+        # Determine size of each head by dividing dim by number of heads.
+        # e.g., for llama-2-7b, dim = 4096, n_head = 32, head_dim = 128
         self.head_dim = self.dim // self.n_head
 
     @classmethod
@@ -44,26 +88,45 @@ class ModelArgs:
         if name in transformer_configs:
             return cls(**transformer_configs[name])
         # fuzzy search
-        config = [config for config in transformer_configs if config in str(name).upper() or config in str(name)]
+        config = [
+            config
+            for config in transformer_configs
+            if config in str(name).upper() or config in str(name)
+        ]
         assert len(config) == 1, name
         return cls(**transformer_configs[config[0]])
 
 
 transformer_configs = {
-    "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
+    "CodeLlama-7b-Python-hf": dict(
+        block_size=16384, vocab_size=32000, n_layer=32, dim=4096, rope_base=1000000
+    ),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
     "30B": dict(n_layer=60, n_head=52, dim=6656),
-    "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
-    "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
+    "34B": dict(
+        n_layer=48,
+        n_head=64,
+        dim=8192,
+        vocab_size=32000,
+        n_local_heads=8,
+        intermediate_size=22016,
+        rope_base=1000000,
+    ),  # CodeLlama-34B-Python-hf
+    "70B": dict(
+        n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672
+    ),
 }
 
+
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(
+        self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16
+    ):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
@@ -76,13 +139,16 @@ class KVCache(nn.Module):
 
         return k_out, v_out
 
+
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(
+            TransformerBlock(config) for _ in range(config.n_layer)
+        )
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -92,17 +158,28 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
 
     def setup_caches(self, max_batch_size, max_seq_length):
-        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+        if (
+            self.max_seq_length >= max_seq_length
+            and self.max_batch_size >= max_batch_size
+        ):
             return
         head_dim = self.config.dim // self.config.n_head
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(
+                max_batch_size, max_seq_length, self.config.n_local_heads, head_dim
+            )
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
-        self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.block_size,
+            self.config.dim // self.config.n_head,
+            self.config.rope_base,
+        )
+        self.causal_mask = torch.tril(
+            torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
+        )
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
@@ -129,7 +206,9 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor
+    ) -> Tensor:
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -159,7 +238,13 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        input_pos: Optional[Tensor] = None,
+    ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -212,10 +297,10 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(
-    seq_len: int, n_elem: int, base: int = 10000
-) -> Tensor:
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:
+    freqs = 1.0 / (
+        base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
+    )
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
