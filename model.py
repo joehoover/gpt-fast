@@ -11,28 +11,15 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+
 def find_multiple(n: int, k: int) -> int:
     """
     Finds the smallest multiple of k that is  >= to n.
-
-    Args:
-        n (int): The number to find the multiple for.
-        k (int): The number to find the multiple of.
-
-    Returns:
-        int: The smallest multiple of k that is greater than or equal to n.
-    
-    Examples:
-        >>> find_multiple(5, 3)
-        6
-        >>> find_multiple(6, 3)
-        6
-        >>> find_multiple(7, 3)
-        9
     """
     if n % k == 0:
         return n
     return n + k - (n % k)
+
 
 @dataclass
 class ModelArgs:
@@ -55,7 +42,7 @@ class ModelArgs:
     # Size of the intermediate layer in the feedforward block
     # If not specified, defaults to:
     # int(2*4*dim/3) rounded to the nearest multiple of 256
-    
+
     n_local_heads: int = -1
     # Number of KV heads. If not specified, defaults to n_head,
     # which implements standard self-attention. If specified,
@@ -71,20 +58,23 @@ class ModelArgs:
         # If n_local_heads is not specified, set number of KV heads to number of Q heads.
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
-        
+
         # If intermediate_size is not specified, set it to 2/3 of 4*dim, rounded to the nearest multiple of 256.
         # e.g., for llama-2-7b, intermediate_size = find_multiple(2/3 * 4 * 4096) = 11008
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
-        
+
         # Determine size of each head by dividing dim by number of heads.
         # e.g., for llama-2-7b, dim = 4096, n_head = 32, head_dim = 128
         self.head_dim = self.dim // self.n_head
 
     @classmethod
     def from_name(cls, name: str):
+        """
+        Create an instance of the class based on the given name.
+        """
         if name in transformer_configs:
             return cls(**transformer_configs[name])
         # fuzzy search
@@ -123,10 +113,26 @@ class KVCache(nn.Module):
     def __init__(
         self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16
     ):
+        """
+        Initializes the GPT-Fast model.
+
+        Args:
+            max_batch_size (int): The maximum batch size.
+            max_seq_length (int): The maximum sequence length.
+            n_heads (int): The number of attention heads.
+            head_dim (int): The dimension of each attention head.
+            dtype (torch.dtype, optional): The data type of the cache tensors. Defaults to torch.bfloat16.
+        """
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        # Define cache as 4D tensor of shape (max_batch_size, n_heads, max_seq_length, head_dim)
+
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
+        # Register Key and Value caches as buffers. Buffers are tensors that are registered in a module,
+        # but are not treated as model parameters. They are typically used for tensors that
+        # need to be saved, but not trained, such as running statistics. In this case,
+        # we store and increment key and value tensors in the cache buffers.
 
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
@@ -134,6 +140,9 @@ class KVCache(nn.Module):
 
         k_out = self.k_cache
         v_out = self.v_cache
+
+        # Doesn't this overwrite the last position?
+        # why not concatenate? Where is this actually used?
         k_out[:, :, input_pos] = k_val
         v_out[:, :, input_pos] = v_val
 
@@ -146,11 +155,21 @@ class Transformer(nn.Module):
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        # Initialize token embeddings as a matrix of shape (vocab_size, dim)
+        # where each row is a token embedding of dimension dim.
+
         self.layers = nn.ModuleList(
             TransformerBlock(config) for _ in range(config.n_layer)
         )
+        # Initialize layers as a list of n_layer TransformerBlocks.
+
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        # Initialize final normalization layer, which is used
+        # to normalize the output of the last TransformerBlock before
+        # passing it to the output layer.
+
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        # Initialize output layer as a linear layer of shape (dim, vocab_size)
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
