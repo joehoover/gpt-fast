@@ -54,8 +54,13 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 
     if top_k is not None:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        # Find `top_k` largest logits in logits
         pivot = v.select(-1, -1).unsqueeze(-1)
+        # Select last element in last dimension of `v`--this is the smallest value in the top-k--and
+        # unsqueeze it--add a dimension--to match the shape of `logits`
         logits = torch.where(logits < pivot, -float("Inf"), logits)
+        # Replace logits smaller than the smallest value in the top-k with -Inf.
+        # This effectively exludes them from sampling.
     probs = torch.nn.functional.softmax(logits, dim=-1)
     # Normalize logits to get probabilities
     return probs
@@ -63,11 +68,12 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     probs = logits_to_probs(logits[0, -1], temperature, top_k)
-    # Covert logits to probabilities
+    # Covert logits to probabilities, perhaps with temperature scaling and top-k
 
     idx_next = multinomial_sample_one_no_sync(probs)
-    # Sample from the distribution to get the next token
+    # Sample the id of the next token from the token probabilities
     return idx_next, probs
+    # Return the sampled token id and the token probabilities
 
 
 def prefill(
@@ -75,7 +81,9 @@ def prefill(
 ) -> torch.Tensor:
     # input_pos: [B, S]
     logits = model(x, input_pos)
+    # Execute a forward pass over the entire input sequence
     return sample(logits, **sampling_kwargs)[0]
+    # Sample and return the next (i.e. first) output token and token probabilities
 
 
 def decode_one_token(
@@ -84,7 +92,9 @@ def decode_one_token(
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
+    # Execute a forward pass over `x`, which is the input sequence + any previously sampled tokens
     return sample(logits, **sampling_kwargs)
+    # Sample and return the next output token and token probabilities
 
 
 def decode_n_tokens(
@@ -99,20 +109,33 @@ def decode_n_tokens(
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_mem_efficient=False, enable_math=True
-        ):  # Actually better for Inductor to codegen attention here
+        ):
+            # This constrains the scaled dot product kernel to _not_ use Flash Attention and
+            # instead fallback to an implementation using more primitive torch operators.
+            # Flash attention is not beneficial for decoding and this allows
+            # Inductor to generate a more efficient kernel.
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
+            # Sample the next token id and get the token probabilities
         input_pos += 1
+        # Increment the input position
         new_tokens.append(next_token.clone())
+        # Append the sampled token id
         callback(new_tokens[-1])
+        # Execute the callback function with the sampled token id
         new_probs.append(next_prob.clone())
+        # Append the new token probabilities
         cur_token = next_token.view(1, -1)
+        # Set the current token to the sampled token id
+        # This will be used as the input to the next iteration of the loop
     return new_tokens, new_probs
+    # Return the sampled tokens and token probabilities
 
 
 def model_forward(model, x, input_pos):
     return model(x, input_pos)
+    # Execute a forward pass over an input sequence `x`
 
 
 def speculative_decode(
@@ -193,6 +216,8 @@ def generate(
     """
 
     is_speculative = draft_model is not None
+    # Flag to indicate whether speculative decoding is enabled. If `draft_model` is `None`, then speculative decoding is disabled.
+
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(0)
     T_new = T + max_new_tokens
@@ -207,6 +232,9 @@ def generate(
     )
     with torch.device(device):
         model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+        # Setup the KV caches for the model.
+        # This allows us to cache KV across decoding steps.
+
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
@@ -217,11 +245,17 @@ def generate(
     input_pos = torch.arange(0, T, device=device)
 
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+    # Generate KV for prompt and sample the next token.
+    # Qs: I thought input_pos was the position of the next token to be generated, not a sequence?
+
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
     seq[T] = next_token
+    # Set the fist token after the prompt to the sampled token id
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    # Set the input position to the position of the first token after the prompt
+
     accept_counts = [0] * (speculate_k + 1)
 
     if is_speculative:
@@ -247,15 +281,21 @@ def generate(
             input_pos,
             max_new_tokens - 1,
             callback=callback,
+            # Note: the default callback is a no-op
             **sampling_kwargs,
         )
+        # Generate `max_new_tokens - 1` tokens, since we already generated the first token
         seq[T + 1 :] = torch.cat(generated_tokens)
+        # Set the generated tokens in the output sequence
 
     generate_stats = {"accept_counts": accept_counts}
     return seq, generate_stats
 
 
 def encode_tokens(tokenizer, string, bos=True, device="cuda"):
+    """
+    Tokenizes a string and converts it to a tensor.
+    """
     tokens = tokenizer.encode(string)
     if bos:
         tokens = [tokenizer.bos_id()] + tokens
@@ -288,6 +328,8 @@ def _load_model(checkpoint_path, device, precision, use_tp):
 
     if use_tp:
         from tp import apply_tp
+
+        # Apply tensor parallelism to the model
 
         print("Applying tensor parallel to model ...")
         apply_tp(model)
@@ -323,6 +365,7 @@ def main(
 
     global print
     rank = maybe_init_dist()
+    # Initialize torch.distributed if running with tensor parallelism
     use_tp = rank is not None
     if use_tp:
         if rank != 0:
@@ -347,8 +390,11 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    # Load the tokenizer
     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    # Encode the prompt as a tensor of token ids
     prompt_length = encoded.size(0)
+    # Get the nuymbet of tokens in the prompt
 
     torch.manual_seed(1234)
     model_size = sum(
@@ -357,6 +403,7 @@ def main(
             for p in itertools.chain(model.parameters(), model.buffers())
         ]
     )
+    # Get the size of model parameters, including KV cache buffers
     if compile:
         if is_speculative and use_tp:
             torch._inductor.config.triton.cudagraph_trees = (
@@ -373,10 +420,13 @@ def main(
         decode_one_token = torch.compile(
             decode_one_token, mode="reduce-overhead", fullgraph=True
         )
+        # Run compile on `decode_one_token`
+        # This will use Inductor to generate CUDA kernels
+        # and it will produce a CUDA graph.
 
-        # Uncomment to squeeze more perf out of prefill
         if args.compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+            # Optionally, also compile `prefill`, which will make prefill faster
 
     aggregate_metrics = {
         "tokens_per_sec": [],
@@ -431,6 +481,7 @@ def main(
                 temperature=temperature,
                 top_k=top_k,
             )
+            # Sample tokens from the model
             aggregate_metrics["accept_counts"].append(metrics["accept_counts"])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")

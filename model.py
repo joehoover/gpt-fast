@@ -141,10 +141,9 @@ class KVCache(nn.Module):
         k_out = self.k_cache
         v_out = self.v_cache
 
-        # Doesn't this overwrite the last position?
-        # why not concatenate? Where is this actually used?
         k_out[:, :, input_pos] = k_val
         v_out[:, :, input_pos] = v_val
+        # Update the KV caches at input_pos with the new key and value vectors.
 
         return k_out, v_out
 
