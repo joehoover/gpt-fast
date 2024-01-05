@@ -181,14 +181,24 @@ class Transformer(nn.Module):
             and self.max_batch_size >= max_batch_size
         ):
             return
+        # `self.max_seq_length` and `self.max_batch_size` are initialized to -1, it seems that this will always be false in this implementation.
+
         head_dim = self.config.dim // self.config.n_head
+        # Determine size of each head by dividing dim by number of heads.
+        # This should be correctly specified in self.config, so this is probably redundant.
+
         max_seq_length = find_multiple(max_seq_length, 8)
+        # Find the smallest multiple of 8 that is >= to max_seq_length and this as the new max_seq_length.
+        # This confers a variety of efficiency benefits, such as allowing for more efficient memory access.
+
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
             b.attention.kv_cache = KVCache(
                 max_batch_size, max_seq_length, self.config.n_local_heads, head_dim
             )
+        # Initialize the KV cache for each TransformerBlock in the Transformer.
+        # As mentioned above, the KV cache is a 4D tensor of shape (max_batch_size, n_heads, max_seq_length, head_dim).
 
         self.freqs_cis = precompute_freqs_cis(
             self.config.block_size,
@@ -198,17 +208,25 @@ class Transformer(nn.Module):
         self.causal_mask = torch.tril(
             torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
         )
+        # Initialize a causal mask of shape (max_seq_length, max_seq_length) with all elements below the diagonal set to True.
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask = self.causal_mask[None, None, input_pos]
+        # Get the causal mask for the current input_pos and add two dimensions to the front.
+        # Note: indexing with `None` can be used to add dimensions to a tensor.
+
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
+        # Get the token embeddings for the current input sequence.
 
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
+            # Apply TransformerBlock i to the output of the previous layer.
         x = self.norm(x)
+        # Apply the final normalization layer to the output of the last TransformerBlock.
         logits = self.output(x)
+        # Apply the output layer to the normed output of the last TransformerBlock.
         return logits
 
     @classmethod
@@ -228,7 +246,9 @@ class TransformerBlock(nn.Module):
         self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor
     ) -> Tensor:
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        # Apply attention to the output of the attention normalization layer and add it to the residual stream.
         out = h + self.feed_forward(self.ffn_norm(h))
+        # Apply feed forward to the output of the feed forward normalization layer.
         return out
 
 
@@ -238,18 +258,27 @@ class Attention(nn.Module):
         assert config.dim % config.n_head == 0
 
         total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
-        # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
+        # key, query, value projections for all heads, but in a batch
+        # If we're using GQA, n_local_heads is < n_head and we wind up with fewer key and value heads than query heads.
+
         self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        # output projection
+
         self.kv_cache = None
+        # KV cache is initialized to None and is set to a KVCache object in Transformer.setup_cache.
 
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self._register_load_state_dict_pre_hook(self.load_hook)
+        # Register a hook that is called before state_dict is loaded.
 
     def load_hook(self, state_dict, prefix, *args):
+        """
+        Make sure that the weights for the key, query, and value projections are concatenated
+        """
         if prefix + "wq.weight" in state_dict:
             wq = state_dict.pop(prefix + "wq.weight")
             wk = state_dict.pop(prefix + "wk.weight")
